@@ -16,8 +16,9 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-THRESHOLD = 0.55  # Change to 0.00 temporarily to force a test alert
-MAX_WORKERS = 8  
+THRESHOLD = 0.55  # Minimum Buy Probability (Set to 0.00 to force a test alert)
+MAX_WORKERS = 10  # Number of simultaneous shards
+CHUNK_SIZE = 250  # Tickers per shard
 
 def load_tickers():
     if os.path.exists("tickers.txt"):
@@ -91,68 +92,75 @@ def send_telegram(text):
     if response.status_code != 200:
         print(f"Telegram API Error: {response.text}")
 
-def process_ticker(t, data, tree_strings):
+def process_batch(batch, tree_strings):
+    """Downloads and processes a shard (chunk) of tickers simultaneously."""
+    batch_signals = []
     try:
-        # Handle MultiIndex dataframe structure returned by bulk yfinance download
-        if isinstance(data.columns, pd.MultiIndex):
-            d = data[t].copy()
-        else:
-            d = data.copy()
-            
-        # Drop dates where the stock did not trade (avoids padding NaNs)
-        d = d.dropna(subset=['Close'])
+        # Download data for this specific chunk
+        data = yf.download(batch, period="3mo", interval="1d", group_by="ticker", threads=True, progress=False)
         
-        if d.empty or len(d) < 55:
-            return None
+        for t in batch:
+            try:
+                # Handle DataFrame structure depending on batch size
+                if len(batch) > 1 and isinstance(data.columns, pd.MultiIndex):
+                    d = data[t].copy()
+                else:
+                    d = data.copy()
+                    
+                # Drop dates where the stock did not trade
+                d = d.dropna(subset=['Close'])
+                
+                if d.empty or len(d) < 55:
+                    continue
 
-        d['return_1d'] = d['Close'].pct_change()
-        d['volatility_20d'] = d['return_1d'].rolling(20).std()
-        
-        d['sma_20'] = ta.sma(d['Close'], length=20)
-        d['sma_20_ratio'] = (d['Close'] / d['sma_20']) - 1.0
-        
-        d['sma_50'] = ta.sma(d['Close'], length=50)
-        d['sma_50_ratio'] = (d['Close'] / d['sma_50']) - 1.0
-        
-        d['rsi_14'] = ta.rsi(d['Close'], length=14)
-        
-        d['atr_14'] = ta.atr(d['High'], d['Low'], d['Close'], length=14)
-        d['atr_ratio'] = d['atr_14'] / d['Close']
+                d['return_1d'] = d['Close'].pct_change()
+                d['volatility_20d'] = d['return_1d'].rolling(20).std()
+                
+                d['sma_20'] = ta.sma(d['Close'], length=20)
+                d['sma_20_ratio'] = (d['Close'] / d['sma_20']) - 1.0
+                
+                d['sma_50'] = ta.sma(d['Close'], length=50)
+                d['sma_50_ratio'] = (d['Close'] / d['sma_50']) - 1.0
+                
+                d['rsi_14'] = ta.rsi(d['Close'], length=14)
+                d['atr_14'] = ta.atr(d['High'], d['Low'], d['Close'], length=14)
+                d['atr_ratio'] = d['atr_14'] / d['Close']
 
-        latest = d.iloc[-1]
+                latest = d.iloc[-1]
+                
+                features = {
+                    'return_1d': latest['return_1d'],
+                    'volatility_20d': latest['volatility_20d'],
+                    'sma_20_ratio': latest['sma_20_ratio'],
+                    'sma_50_ratio': latest['sma_50_ratio'],
+                    'rsi_14': latest['rsi_14'],
+                    'atr_14': latest['atr_14'],
+                    'atr_ratio': latest['atr_ratio']
+                }
+                
+                if pd.isna(list(features.values())).any():
+                    continue
+
+                score = 0.0
+                for tree in tree_strings:
+                    score += evaluate_tree(tree, features)
+                    
+                baseline = -3.70558681
+                raw_margin = baseline + score
+                prob = 1.0 / (1.0 + math.exp(-raw_margin))
+
+                if prob >= THRESHOLD:
+                    batch_signals.append({
+                        "ticker": t.replace(".NS", ""), 
+                        "price": latest['Close'], 
+                        "prob": prob * 100 
+                    })
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Error processing batch: {e}")
         
-        features = {
-            'return_1d': latest['return_1d'],
-            'volatility_20d': latest['volatility_20d'],
-            'sma_20_ratio': latest['sma_20_ratio'],
-            'sma_50_ratio': latest['sma_50_ratio'],
-            'rsi_14': latest['rsi_14'],
-            'atr_14': latest['atr_14'],
-            'atr_ratio': latest['atr_ratio']
-        }
-        
-        if pd.isna(list(features.values())).any():
-            return None
-
-        score = 0.0
-        for tree in tree_strings:
-            score += evaluate_tree(tree, features)
-            
-        baseline = -3.70558681
-        raw_margin = baseline + score
-        prob = 1.0 / (1.0 + math.exp(-raw_margin))
-
-        if prob >= THRESHOLD:
-            clean_ticker = t.replace(".NS", "")
-            return {
-                "ticker": clean_ticker, 
-                "price": latest['Close'], 
-                "prob": prob * 100 
-            }
-        return None
-
-    except Exception:
-        return None
+    return batch_signals
 
 def format_row(ticker, price, prob):
     safe_ticker = html.escape(ticker)
@@ -168,18 +176,19 @@ def scan():
     tickers = load_tickers()
     signals = []
     
-    print(f"📡 Bulk downloading data for {len(tickers)} tickers...")
-    # Single network request for all data
-    data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", threads=True, progress=False)
-
-    print(f"🤖 Starting GBDT inference across {len(tickers)} tickers...")
+    # Chunk the tickers into smaller lists (shards)
+    shards = [tickers[i:i + CHUNK_SIZE] for i in range(0, len(tickers), CHUNK_SIZE)]
+    
+    print(f"📡 Processing {len(tickers)} tickers across {len(shards)} shards...")
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_ticker, t, data, tree_strings): t for t in tickers}
+        # Submit each shard to a thread worker
+        futures = [executor.submit(process_batch, shard, tree_strings) for shard in shards]
         
         for future in as_completed(futures):
             res = future.result()
             if res:
-                signals.append(res)
+                signals.extend(res) # Combine the signals from each shard
 
     if not signals:
         print("🏁 Scan complete. No GBDT Long signals generated today.")
@@ -199,7 +208,7 @@ def scan():
     msg += "</pre>"
 
     send_telegram(msg)
-    print("✅ GBDT alert report compiled and sent to Telegram!")
+    print(f"✅ {len(signals)} signals found. Alert report compiled and sent to Telegram!")
 
 if __name__ == "__main__":
     scan()
