@@ -8,11 +8,15 @@ import pandas as pd
 import pandas_ta as ta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+import warnings
+
+# Suppress pandas FutureWarnings from yfinance
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-THRESHOLD = 0.55  # Minimum Buy Probability
+THRESHOLD = 0.55  # Change to 0.00 temporarily to force a test alert
 MAX_WORKERS = 8  
 
 def load_tickers():
@@ -22,7 +26,6 @@ def load_tickers():
     return ["DIXON.NS", "LUPIN.NS"]
 
 def load_gbdt_model():
-    """Reads the Pine Script text file and extracts all the tree string components."""
     if not os.path.exists("pine_script.txt"):
         print("Error: pine_script.txt not found!")
         return []
@@ -33,16 +36,13 @@ def load_gbdt_model():
     tree_strings = []
     for line in model_text.split('\n'):
         line = line.strip()
-        # Find every line that adds a chunk to the score
         if line.startswith('score +='):
             expression = line.replace('score +=', '').strip()
             tree_strings.append(expression)
     return tree_strings
 
 def evaluate_tree(pine_str, features):
-    """Dynamically parses and evaluates Pine Script ternary trees."""
     s = pine_str
-    # Replace feature names with their actual calculated values
     for k, v in features.items():
         s = re.sub(r'\b' + k + r'\b', str(v), s)
         
@@ -53,7 +53,6 @@ def evaluate_tree(pine_str, features):
         
         depth = 0
         q_idx, c_idx = -1, -1
-        # Find the outermost ternary operators
         for i, char in enumerate(node_str):
             if char == '(': depth += 1
             elif char == ')': depth -= 1
@@ -65,14 +64,12 @@ def evaluate_tree(pine_str, features):
             true_str = node_str[q_idx+1:c_idx].strip()
             false_str = node_str[c_idx+1:].strip()
             
-            # Evaluate the boolean condition
             if '<=' in cond_str:
                 left, right = cond_str.split('<=')
                 cond = float(left.strip()) <= float(right.strip())
             else:
                 cond = False
             
-            # Recursively walk the decision tree
             return eval_node(true_str) if cond else eval_node(false_str)
         else:
             return float(node_str)
@@ -81,6 +78,7 @@ def evaluate_tree(pine_str, features):
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Telegram credentials missing.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -89,17 +87,24 @@ def send_telegram(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    requests.post(url, data=payload, timeout=10)
+    response = requests.post(url, data=payload, timeout=10)
+    if response.status_code != 200:
+        print(f"Telegram API Error: {response.text}")
 
-def process_ticker(t, tree_strings):
+def process_ticker(t, data, tree_strings):
     try:
-        ticker_obj = yf.Ticker(t)
-        # 3 months is plenty of data to calculate a 50 SMA and 20d Volatility
-        d = ticker_obj.history(period="3mo", interval="1d")
+        # Handle MultiIndex dataframe structure returned by bulk yfinance download
+        if isinstance(data.columns, pd.MultiIndex):
+            d = data[t].copy()
+        else:
+            d = data.copy()
+            
+        # Drop dates where the stock did not trade (avoids padding NaNs)
+        d = d.dropna(subset=['Close'])
+        
         if d.empty or len(d) < 55:
             return None
 
-        # --- 1. EXACT FEATURE RECONSTRUCTION ---
         d['return_1d'] = d['Close'].pct_change()
         d['volatility_20d'] = d['return_1d'].rolling(20).std()
         
@@ -114,10 +119,8 @@ def process_ticker(t, tree_strings):
         d['atr_14'] = ta.atr(d['High'], d['Low'], d['Close'], length=14)
         d['atr_ratio'] = d['atr_14'] / d['Close']
 
-        # Get latest day's values
         latest = d.iloc[-1]
         
-        # Verify no NaN values exist in our features
         features = {
             'return_1d': latest['return_1d'],
             'volatility_20d': latest['volatility_20d'],
@@ -131,7 +134,6 @@ def process_ticker(t, tree_strings):
         if pd.isna(list(features.values())).any():
             return None
 
-        # --- 2. EVALUATE GBDT ENSEMBLE ---
         score = 0.0
         for tree in tree_strings:
             score += evaluate_tree(tree, features)
@@ -145,7 +147,7 @@ def process_ticker(t, tree_strings):
             return {
                 "ticker": clean_ticker, 
                 "price": latest['Close'], 
-                "prob": prob * 100 # Convert to percentage
+                "prob": prob * 100 
             }
         return None
 
@@ -165,12 +167,14 @@ def scan():
 
     tickers = load_tickers()
     signals = []
-    total = len(tickers)
+    
+    print(f"📡 Bulk downloading data for {len(tickers)} tickers...")
+    # Single network request for all data
+    data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", threads=True, progress=False)
 
-    print(f"🤖 Starting GBDT inference across {total} tickers...")
-
+    print(f"🤖 Starting GBDT inference across {len(tickers)} tickers...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_ticker, t, tree_strings): t for t in tickers}
+        futures = {executor.submit(process_ticker, t, data, tree_strings): t for t in tickers}
         
         for future in as_completed(futures):
             res = future.result()
@@ -182,8 +186,6 @@ def scan():
         return
 
     ist_time = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%d %b %Y, %I:%M %p")
-    
-    # Sort highest probability first
     signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
 
     msg = f"<b>🤖 GBDT Model Signals</b>\n<i>{ist_time}</i>\n\n"
